@@ -11,8 +11,9 @@ import os
 import struct
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Optional
 
 
 # Map resource type codes to human-readable directory names
@@ -52,23 +53,83 @@ def get_resource_type_dir(type_code: str) -> str:
     return RESOURCE_TYPE_NAMES.get(type_code, type_code.lower())
 
 
+def pilot_time_to_datetime(pilot_time: int) -> Optional[datetime]:
+    """
+    Convert Pilot time (seconds since Jan 1, 1904) to Python datetime.
+    
+    Pilot uses the Macintosh epoch (Jan 1, 1904) while Unix uses Jan 1, 1970.
+    Returns None if pilot_time is 0.
+    """
+    if pilot_time == 0:
+        return None
+    # Pilot time uses Mac epoch (1904), subtract offset to get Unix timestamp (1970)
+    unix_time = pilot_time - 2082844800
+    return datetime.fromtimestamp(unix_time, tz=timezone.utc)
+
+
+def validate_prc_header(hdr: "PRCHeader", strict: bool = False) -> list[str]:
+    """
+    Validate PRC header fields according to the PRC specification.
+    
+    Args:
+        hdr: PRCHeader to validate
+        strict: If True, treat all warnings as errors
+    
+    Returns:
+        List of warning/error messages (empty if valid)
+    """
+    warnings = []
+    
+    # Check flags - should be 0x01 for PRC executables
+    if hdr.flags & 0x01 != 0x01 and strict:
+        warnings.append(f"Flags 0x{hdr.flags:04x} doesn't have 0x01 bit set (not a PRC executable?)")
+    
+    # Check version - typically 0x01
+    if hdr.version != 0x01 and strict:
+        warnings.append(f"Version 0x{hdr.version:04x} is not 0x01")
+    
+    # Check type - should be 'appl' for executables
+    type_str = hdr.type.to_bytes(4, 'big').decode('ascii', errors='replace')
+    if type_str != 'appl' and strict:
+        warnings.append(f"Type '{type_str}' is not 'appl' (not an application?)")
+    
+    # Check fields that must be zero for PRC executables
+    if strict:
+        if hdr.mod_num != 0:
+            warnings.append(f"mod_num should be 0, got {hdr.mod_num}")
+        if hdr.app_info != 0:
+            warnings.append(f"app_info should be 0, got 0x{hdr.app_info:08x}")
+        if hdr.sort_info != 0:
+            warnings.append(f"sort_info should be 0, got 0x{hdr.sort_info:08x}")
+        if hdr.unique_id_seed != 0:
+            warnings.append(f"unique_id_seed should be 0, got 0x{hdr.unique_id_seed:08x}")
+        if hdr.next_record_list != 0:
+            warnings.append(f"next_record_list should be 0, got 0x{hdr.next_record_list:08x}")
+    
+    return warnings
+
+
 @dataclass(frozen=True)
 class PRCHeader:
-    """PalmOS PRC file header structure"""
-    name: bytes  # 32 bytes, zero-terminated string
-    flags: int  # unsigned short
-    version: int  # unsigned short
-    create_time: int  # unsigned long (pilot_time_t)
-    mod_time: int  # unsigned long
-    backup_time: int  # unsigned long
-    mod_num: int  # unsigned long
-    app_info: int  # unsigned long
-    sort_info: int  # unsigned long
-    type: int  # unsigned long
-    id: int  # unsigned long
-    unique_id_seed: int  # unsigned long
-    next_record_list: int  # unsigned long
-    num_records: int  # unsigned short
+    """
+    PalmOS PRC file header structure (78 bytes total)
+    
+    Reference: https://mail.palm.wiki/prc
+    """
+    name: bytes  # 32 bytes, zero-terminated string (sometimes zero-padded)
+    flags: int  # unsigned short - 0x01 for PRC executables, 0x40 bit = non-beamable
+    version: int  # unsigned short - typically 0x01 for PRC executables
+    create_time: int  # unsigned long - pilot_time_t (seconds since Jan 1, 1904)
+    mod_time: int  # unsigned long - pilot_time_t
+    backup_time: int  # unsigned long - pilot_time_t
+    mod_num: int  # unsigned long - must be zero for PRC executables
+    app_info: int  # unsigned long - must be zero for PRC executables
+    sort_info: int  # unsigned long - must be zero for PRC executables
+    type: int  # unsigned long - must be 'appl' for PRC executables
+    id: int  # unsigned long - four character "creator code" (like Mac)
+    unique_id_seed: int  # unsigned long - must be zero for PRC executables
+    next_record_list: int  # unsigned long - must be zero for PRC executables
+    num_records: int  # unsigned short - number of resources in the file
 
 
 @dataclass(frozen=True)
@@ -101,7 +162,51 @@ def read_resource_header(fp: BinaryIO) -> ResourceHeader:
     return ResourceHeader(name, id_val, offset)
 
 
-def extract_resources(input_file: Path, output_dir: Path, organize_by_type: bool = False) -> int:
+def print_header_info(hdr: "PRCHeader") -> None:
+    """Print detailed PRC header information."""
+    print("=" * 60)
+    print("PRC HEADER INFORMATION")
+    print("=" * 60)
+    
+    # Extract name (zero-terminated)
+    name_str = hdr.name.split(b'\x00')[0].decode('ascii', errors='replace')
+    print(f"Name:              {name_str}")
+    
+    # Extract type and creator ID
+    type_str = hdr.type.to_bytes(4, 'big').decode('ascii', errors='replace')
+    id_str = hdr.id.to_bytes(4, 'big').decode('ascii', errors='replace')
+    print(f"Type:              {type_str}")
+    print(f"Creator ID:        {id_str}")
+    
+    # Flags
+    beamable = "No" if (hdr.flags & 0x40) else "Yes"
+    print(f"Flags:             0x{hdr.flags:04x} (Beamable: {beamable})")
+    print(f"Version:           0x{hdr.version:04x}")
+    
+    # Timestamps
+    create_dt = pilot_time_to_datetime(hdr.create_time)
+    mod_dt = pilot_time_to_datetime(hdr.mod_time)
+    backup_dt = pilot_time_to_datetime(hdr.backup_time)
+    
+    print(f"Created:           {create_dt.strftime('%Y-%m-%d %H:%M:%S UTC') if create_dt else 'N/A'}")
+    print(f"Modified:          {mod_dt.strftime('%Y-%m-%d %H:%M:%S UTC') if mod_dt else 'N/A'}")
+    print(f"Last Backup:       {backup_dt.strftime('%Y-%m-%d %H:%M:%S UTC') if backup_dt else 'N/A'}")
+    
+    # Resource count
+    print(f"Number of Records: {hdr.num_records}")
+    
+    # Validation warnings
+    warnings = validate_prc_header(hdr, strict=False)
+    if warnings:
+        print("\nWARNINGS:")
+        for warning in warnings:
+            print(f"  - {warning}")
+    
+    print("=" * 60)
+    print()
+
+
+def extract_resources(input_file: Path, output_dir: Path, organize_by_type: bool = False, verbose: bool = False) -> int:
     """
     Extract all resources from a PRC file to the specified output directory.
     
@@ -109,6 +214,7 @@ def extract_resources(input_file: Path, output_dir: Path, organize_by_type: bool
         input_file: Path to the PRC file
         output_dir: Directory to extract resources to
         organize_by_type: If True, create subdirectories for each resource type
+        verbose: If True, print detailed header information
     
     Returns the number of resources extracted.
     """
@@ -118,6 +224,10 @@ def extract_resources(input_file: Path, output_dir: Path, organize_by_type: bool
     with open(input_file, 'rb') as fp:
         # Read header
         hdr = read_prc_header(fp)
+        
+        # Display header info if verbose
+        if verbose:
+            print_header_info(hdr)
         
         # Read all resource headers
         resources = []
@@ -203,6 +313,11 @@ def main():
         dest="organize_by_type",
         help="Organize extracted files into subdirectories by resource type"
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print detailed header information including timestamps and creator ID"
+    )
     
     args = parser.parse_args()
     
@@ -211,7 +326,7 @@ def main():
         sys.exit(1)
     
     try:
-        extract_resources(args.input_file, args.output_dir, args.organize_by_type)
+        extract_resources(args.input_file, args.output_dir, args.organize_by_type, args.verbose)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)

@@ -31,6 +31,7 @@ chmod +x main.py
 ### Options
 
 - `-t, --by-type`: Organize extracted files into subdirectories by resource type (e.g., `code/`, `forms/`, `fonts/`, `bitmaps/`)
+- `-v, --verbose`: Print detailed header information including timestamps, creator ID, and validation warnings
 
 ### Examples
 
